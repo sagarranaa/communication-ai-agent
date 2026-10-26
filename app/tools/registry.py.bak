@@ -1,0 +1,141 @@
+import json
+import logging
+from datetime import date
+from typing import Any
+
+import pymysql
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+from app.llm.schemas import ToolDefinition
+from app.repositories.messages import get_message_summary
+
+
+logger = logging.getLogger("uvicorn.error")
+
+
+class StatusLookupArguments(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    status_code: int
+
+
+class MessageSummaryArguments(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    start_date: date = Field(
+        description="Inclusive start date in YYYY-MM-DD format."
+    )
+    end_date: date = Field(
+        description=(
+            "Exclusive end date in YYYY-MM-DD format. "
+            "The range must be between 1 and 31 days."
+        )
+    )
+
+
+WHATSAPP_STATUSES = {
+    1: "submitted",
+    2: "sent",
+    3: "delivered",
+    4: "read",
+    9: "failed",
+}
+
+
+TOOL_DEFINITIONS = [
+    ToolDefinition(
+        name="lookup_whatsapp_status",
+        description=(
+            "Look up a numeric status code from the whatsapp_meta "
+            "message table. Does not apply to global_campaigner."
+        ),
+        parameters=StatusLookupArguments.model_json_schema(),
+    ),
+    ToolDefinition(
+        name="get_whatsapp_message_summary",
+        description=(
+            "Query MySQL for WhatsApp message counts by current status "
+            "for the configured development account. "
+            "Filters records using their created_at date. "
+            "Start date is inclusive; end date is exclusive. "
+            "Maximum range is 31 days. "
+            "The account is fixed by the backend and cannot be changed "
+            "through tool arguments. This tool does not provide "
+            "failure reasons or campaign-specific results."
+        ),
+        parameters=MessageSummaryArguments.model_json_schema(),
+    ),
+]
+
+
+def execute_tool(
+    name: str,
+    arguments_json: str,
+) -> dict[str, Any]:
+    try:
+        if name == "lookup_whatsapp_status":
+            arguments = StatusLookupArguments.model_validate_json(
+                arguments_json
+            )
+
+            meaning = WHATSAPP_STATUSES.get(arguments.status_code)
+
+            return {
+                "ok": True,
+                "status_code": arguments.status_code,
+                "meaning": meaning or "unknown",
+                "mapping_known": meaning is not None,
+                "source": "Provided whatsapp_meta.status schema comment",
+                "live_database_query": False,
+            }
+
+        if name == "get_whatsapp_message_summary":
+            arguments = MessageSummaryArguments.model_validate_json(
+                arguments_json
+            )
+
+            summary = get_message_summary(
+                start_date=arguments.start_date,
+                end_date=arguments.end_date,
+            )
+
+            return {
+                "ok": True,
+                "data": summary,
+            }
+
+        return {
+            "ok": False,
+            "error": "Unknown tool.",
+        }
+
+    except ValidationError:
+        return {
+            "ok": False,
+            "error": (
+                "Invalid tool arguments. Follow the tool schema. "
+                "Dates must be YYYY-MM-DD strings."
+            ),
+        }
+
+    except ValueError as exc:
+        return {
+            "ok": False,
+            "error": str(exc),
+        }
+
+    except pymysql.MySQLError as exc:
+        code = exc.args[0] if exc.args else "unknown"
+        logger.error("Database tool failed; MySQL code=%s", code)
+
+        return {
+            "ok": False,
+            "error": (
+                "The database query failed. "
+                "No message counts were retrieved."
+            ),
+        }
+
+
+def serialize_tool_result(result: dict[str, Any]) -> str:
+    return json.dumps(result, ensure_ascii=False)

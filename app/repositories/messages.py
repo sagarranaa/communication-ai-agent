@@ -1,0 +1,243 @@
+import re
+from datetime import date
+
+from app.config import get_settings
+from app.db import mysql_connection
+
+
+STATUS_NAMES = {
+    1: "submitted",
+    2: "sent",
+    3: "delivered",
+    4: "read",
+    9: "failed",
+}
+
+
+def quote_schema(name: str) -> str:
+    # SQL parameters cannot represent database/table identifiers.
+    # Accept only simple configured schema names.
+    if not re.fullmatch(r"[A-Za-z0-9_]+", name):
+        raise ValueError("Invalid configured database schema name.")
+
+    return f"`{name}`"
+
+
+def get_message_summary(
+    start_date: date,
+    end_date: date,
+) -> dict:
+    if end_date <= start_date:
+        raise ValueError("end_date must be after start_date.")
+
+    if (end_date - start_date).days > 31:
+        raise ValueError("Use a date range of at most 31 days.")
+
+    settings = get_settings()
+
+    if settings.app_env != "development":
+        raise ValueError(
+            "The fixed development account is only enabled in development."
+        )
+
+    username = settings.dev_account_username.strip()
+
+    if not username:
+        raise ValueError("Set DEV_ACCOUNT_USERNAME in .env.")
+
+    whatsapp_schema = quote_schema(settings.mysql_whatsapp_schema)
+
+    with mysql_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT UserId, Username, Active
+                FROM `Main`.`Customers`
+                WHERE Username = %s
+                LIMIT 2
+                """,
+                (username,),
+            )
+
+            customers = cursor.fetchall()
+
+            if len(customers) != 1:
+                raise ValueError(
+                    "Expected exactly one configured customer."
+                )
+
+            customer = customers[0]
+
+            # Customers schema: 0 = active, 1 = deactivated.
+            if customer["Active"] != 0:
+                raise ValueError("The configured customer is deactivated.")
+
+            cursor.execute(
+                f"""
+                SELECT status, COUNT(*) AS message_count
+                FROM {whatsapp_schema}.`whatsapp_meta`
+                WHERE userid = %s
+                  AND username = %s
+                  AND created_at >= %s
+                  AND created_at < %s
+                GROUP BY status
+                ORDER BY status
+                """,
+                (
+                    customer["UserId"],
+                    customer["Username"],
+                    start_date,
+                    end_date,
+                ),
+            )
+
+            rows = cursor.fetchall()
+
+    counts = [
+        {
+            "status_code": row["status"],
+            "status": STATUS_NAMES.get(row["status"], "unknown"),
+            "count": int(row["message_count"]),
+        }
+        for row in rows
+    ]
+
+    return {
+        "account": customer["Username"],
+        "source": (
+            f"{settings.mysql_whatsapp_schema}.whatsapp_meta"
+        ),
+        "start_inclusive": start_date.isoformat(),
+        "end_exclusive": end_date.isoformat(),
+        "date_basis": (
+            "Stored created_at values; storage timezone not yet verified."
+        ),
+        "account_filter": "userid AND username",
+        "total_matching_records": sum(item["count"] for item in counts),
+        "counts_by_current_status": counts,
+        "live_database_query": True,
+    }
+
+
+
+def get_failure_breakdown(
+    start_date: date,
+    end_date: date,
+) -> dict:
+    if end_date <= start_date:
+        raise ValueError("end_date must be after start_date.")
+
+    if (end_date - start_date).days > 31:
+        raise ValueError("Use a date range of at most 31 days.")
+
+    settings = get_settings()
+
+    if settings.app_env != "development":
+        raise ValueError(
+            "The fixed development account is only enabled in development."
+        )
+
+    username = settings.dev_account_username.strip()
+
+    if not username:
+        raise ValueError("Set DEV_ACCOUNT_USERNAME in .env.")
+
+    whatsapp_schema = quote_schema(settings.mysql_whatsapp_schema)
+
+    with mysql_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT UserId, Username, Active
+                FROM `Main`.`Customers`
+                WHERE Username = %s
+                LIMIT 2
+                """,
+                (username,),
+            )
+
+            customers = cursor.fetchall()
+
+            if len(customers) != 1:
+                raise ValueError(
+                    "Expected exactly one configured customer."
+                )
+
+            customer = customers[0]
+
+            if customer["Active"] != 0:
+                raise ValueError("The configured customer is deactivated.")
+
+            parameters = (
+                customer["UserId"],
+                customer["Username"],
+                start_date,
+                end_date,
+            )
+
+            cursor.execute(
+                f"""
+                SELECT COUNT(*) AS failure_count
+                FROM {whatsapp_schema}.`whatsapp_meta`
+                WHERE userid = %s
+                  AND username = %s
+                  AND created_at >= %s
+                  AND created_at < %s
+                  AND status = 9
+                """,
+                parameters,
+            )
+
+            total_failures = int(cursor.fetchone()["failure_count"])
+
+            cursor.execute(
+                f"""
+                SELECT
+                    NULLIF(TRIM(`error`), '') AS error_code,
+                    NULLIF(TRIM(error_reason), '') AS error_reason,
+                    COUNT(*) AS message_count
+                FROM {whatsapp_schema}.`whatsapp_meta`
+                WHERE userid = %s
+                  AND username = %s
+                  AND created_at >= %s
+                  AND created_at < %s
+                  AND status = 9
+                GROUP BY
+                    NULLIF(TRIM(`error`), ''),
+                    NULLIF(TRIM(error_reason), '')
+                ORDER BY message_count DESC, error_code, error_reason
+                LIMIT 10
+                """,
+                parameters,
+            )
+
+            groups = [
+                {
+                    "error_code": row["error_code"],
+                    "error_reason": row["error_reason"],
+                    "count": int(row["message_count"]),
+                }
+                for row in cursor.fetchall()
+            ]
+
+    return {
+        "account": customer["Username"],
+        "source": f"{settings.mysql_whatsapp_schema}.whatsapp_meta",
+        "start_inclusive": start_date.isoformat(),
+        "end_exclusive": end_date.isoformat(),
+        "date_basis": (
+            "Stored created_at values; storage timezone not yet verified."
+        ),
+        "failure_status_code": 9,
+        "total_failed_records": total_failures,
+        "top_error_groups": groups,
+        "returned_group_limit": 10,
+        "records_in_returned_groups": sum(
+            group["count"] for group in groups
+        ),
+        "interpretation": (
+            "Recorded errors are evidence, not independently verified "
+            "root causes. Null values mean no error detail was recorded."
+        ),
+        "live_database_query": True,
+    }
